@@ -170,7 +170,7 @@ import {
 	getExecutionRedactionReason,
 	loadExecutionForViewer,
 } from '@/executions/execution-viewer-reader';
-import { CredentialsPermissionChecker } from '@/executions/pre-execution-checks';
+import { type CredentialRefusal, findCredentialRefusal } from '@/executions/pre-execution-checks';
 import { License } from '@/license';
 import { LoadNodesAndCredentials } from '@/load-nodes-and-credentials';
 import { AgentsBuilderService } from '@/modules/agents/builder/agents-builder.service';
@@ -2116,30 +2116,6 @@ export class InstanceAiAdapterService {
 			return execution;
 		};
 
-		/**
-		 * The credential check `WorkflowRunner.run` makes for this user, made up
-		 * front for its message. The runner saves a refused run as a failed
-		 * execution, and redaction strips the reason from that execution when the
-		 * credential is one this user cannot use. The runner still makes the
-		 * check that counts.
-		 */
-		const findCredentialRefusal = async (
-			workflowId: string,
-			nodes: INode[],
-		): Promise<CredentialRefusal | undefined> => {
-			try {
-				await Container.get(CredentialsPermissionChecker).check(workflowId, nodes, user.id);
-				return undefined;
-			} catch (error) {
-				if (!(error instanceof UserError)) return undefined;
-				const node: unknown = Reflect.get(error, 'node');
-				return {
-					message: [error.message, error.description].filter(Boolean).join('. '),
-					nodeName: isNodeLike(node) ? node.name : undefined,
-				};
-			}
-		};
-
 		/** The outcome of a run, read back for the agent. Missing data reads as `unknown`. */
 		const readOutcome = async (executionId: string, subNodeTarget?: string) => {
 			const execution = await loadExecutionForViewer(executionId, user);
@@ -2236,7 +2212,7 @@ export class InstanceAiAdapterService {
 					? omitWorkflowConnections(workflow.connections, options.omitConnections)
 					: workflow.connections;
 
-				const credentialRefusal = await findCredentialRefusal(workflowId, nodes);
+				const credentialRefusal = await findCredentialRefusal(workflowId, nodes, user.id);
 
 				// Force-save AI-initiated executions so that follow-up
 				// `executions(list/get/debug)` calls can read the result, regardless of
@@ -2722,7 +2698,7 @@ export class InstanceAiAdapterService {
 					};
 				};
 
-				const credentialRefusal = await findCredentialRefusal(workflowId, nodes);
+				const credentialRefusal = await findCredentialRefusal(workflowId, nodes, user.id);
 
 				try {
 					const executionId = await workflowRunner.run(runData);
@@ -4788,15 +4764,6 @@ export async function extractExecutionResult(
 	return (await extractExecutionOutcome(execution, includeOutputData, nodeTypes)).result;
 }
 
-/** Why `WorkflowRunner.run` refuses to run a workflow for a user. */
-type CredentialRefusal = { message: string; nodeName?: string };
-
-function isNodeLike(value: unknown): value is { name: string } {
-	return (
-		typeof value === 'object' && value !== null && typeof Reflect.get(value, 'name') === 'string'
-	);
-}
-
 /**
  * Put the refusal reason on a refused run's result. A run that failed for
  * another reason keeps its own error.
@@ -4806,13 +4773,12 @@ function withCredentialRefusal<T extends ExecutionResult>(
 	refusal: CredentialRefusal | undefined,
 ): T {
 	if (!refusal || result.status !== 'error') return result;
+	const message = [refusal.message, refusal.description].filter(Boolean).join('. ');
 	return {
 		...result,
-		error: refusal.message,
+		error: message,
 		nodeErrors: result.nodeErrors?.map((nodeError) =>
-			nodeError.nodeName === refusal.nodeName
-				? { ...nodeError, message: refusal.message }
-				: nodeError,
+			nodeError.nodeName === refusal.nodeName ? { ...nodeError, message } : nodeError,
 		),
 	};
 }
